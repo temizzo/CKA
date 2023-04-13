@@ -1,29 +1,34 @@
-#! /bin/bash
+#!/bin/bash
+#
+# Common setup for all servers (Control Plane and Nodes)
+
+set -euxo pipefail
 
 # Variable Declaration
-KUBERNETES_VERSION="1.23.3-00"
 
-# disable swap 
+# DNS Setting
+if [ ! -d /etc/systemd/resolved.conf.d ]; then
+	sudo mkdir /etc/systemd/resolved.conf.d/
+fi
+cat <<EOF | sudo tee /etc/systemd/resolved.conf.d/dns_servers.conf
+[Resolve]
+DNS=${DNS_SERVERS}
+EOF
+
+sudo systemctl restart systemd-resolved
+
+# disable swap
 sudo swapoff -a
-# keeps the swaf off during reboot
-sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
 
-#Letting iptables see bridged traffic 
-lsmod | grep br_netfilter
-sudo modprobe br_netfilter
+# keeps the swap off during reboot
+(crontab -l 2>/dev/null; echo "@reboot /sbin/swapoff -a") | crontab - || true
+sudo apt-get update -y
+# Install CRI-O Runtime
 
-cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
-br_netfilter
-EOF
+VERSION="$(echo ${KUBERNETES_VERSION} | grep -oE '[0-9]+\.[0-9]+')"
 
-cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
-net.bridge.bridge-nf-call-ip6tables = 1
-net.bridge.bridge-nf-call-iptables = 1
-EOF
-sudo sysctl --system
-
-# containerd
-cat <<EOF | sudo tee /etc/modules-load.d/containerd.conf
+# Create the .conf file to load the modules at bootup
+cat <<EOF | sudo tee /etc/modules-load.d/crio.conf
 overlay
 br_netfilter
 EOF
@@ -31,61 +36,48 @@ EOF
 sudo modprobe overlay
 sudo modprobe br_netfilter
 
-# Setup required sysctl params, these persist across reboots.
+# Set up required sysctl params, these persist across reboots.
 cat <<EOF | sudo tee /etc/sysctl.d/99-kubernetes-cri.conf
 net.bridge.bridge-nf-call-iptables  = 1
 net.ipv4.ip_forward                 = 1
 net.bridge.bridge-nf-call-ip6tables = 1
 EOF
 
-# Apply sysctl params without reboot
 sudo sysctl --system
 
-#Clean Install Docker Engine on Ubuntu
-sudo apt-get remove docker docker-engine docker.io containerd runc
-sudo apt-get update -y
-sudo apt-get install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    gnupg \
-    lsb-release
+cat <<EOF | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/ /
+EOF
+cat <<EOF | sudo tee /etc/apt/sources.list.d/devel:kubic:libcontainers:stable:cri-o:$VERSION.list
+deb http://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/ /
+EOF
 
-#Add Docker’s official GPG key:
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/$VERSION/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers.gpg add -
+curl -L https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/$OS/Release.key | sudo apt-key --keyring /etc/apt/trusted.gpg.d/libcontainers.gpg add -
 
-#set up the stable repository
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+sudo apt-get update
+sudo apt-get install cri-o cri-o-runc -y
 
-#Install Docker Engine
-sudo apt-get update -y
-sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+cat >> /etc/default/crio << EOF
+${ENVIRONMENT}
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable crio --now
 
-#Configure containerd
-sudo mkdir -p /etc/containerd
-containerd config default | sudo tee /etc/containerd/config.toml
+echo "CRI runtime installed susccessfully"
 
-#restart containerd
-sudo systemctl restart containerd
-
-echo "ContainerD Runtime Configured Successfully"
-
-#Installing kubeadm, kubelet and kubectl
-sudo apt-get update -y 
+sudo apt-get update
 sudo apt-get install -y apt-transport-https ca-certificates curl
-
-#Google Cloud public signing key
 sudo curl -fsSLo /usr/share/keyrings/kubernetes-archive-keyring.gpg https://packages.cloud.google.com/apt/doc/apt-key.gpg
 
-#Add Kubernetes apt repository
 echo "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main" | sudo tee /etc/apt/sources.list.d/kubernetes.list
-
-#Update apt package index, install kubelet, kubeadm and kubectl, and pin their version:
 sudo apt-get update -y
+sudo apt-get install -y kubelet="$KUBERNETES_VERSION" kubectl="$KUBERNETES_VERSION" kubeadm="$KUBERNETES_VERSION"
+sudo apt-get update -y
+sudo apt-get install -y jq
 
-sudo apt-get install -y kubelet kubectl kubeadm
-
-sudo apt-mark hold kubelet kubeadm kubectl
-
+local_ip="$(ip --json a s | jq -r '.[] | if .ifname == "eth1" then .addr_info[] | if .family == "inet" then .local else empty end else empty end')"
+cat > /etc/default/kubelet << EOF
+KUBELET_EXTRA_ARGS=--node-ip=$local_ip
+${ENVIRONMENT}
+EOF
