@@ -11,7 +11,6 @@
 To provision the cluster, execute the following commands.
 
 ```shell
-git clone https://github.com/ahmadjubair33/vagrant-kubernetes.git
 cd vagrant-kubeadm-kubernetes
 vagrant up
 ```
